@@ -14,6 +14,7 @@ import numpy as np
 import os
 import sys
 import torch
+import torch.multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 from torch import nn
@@ -31,6 +32,7 @@ from snowfall.common import describe, str2bool
 from snowfall.common import load_checkpoint, save_checkpoint
 from snowfall.common import save_training_info
 from snowfall.common import setup_logger
+from snowfall.dist import cleanup_dist, setup_dist
 from snowfall.models import AcousticModel
 from snowfall.models.conformer import Conformer
 from snowfall.models.transformer import Noam, Transformer
@@ -414,6 +416,16 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        '--world-size',
+        type=int,
+        default=1,
+        help='Number of GPUs for DDP training.')
+    parser.add_argument(
+        '--master-port',
+        type=int,
+        default=12354,
+        help='Master port to use for DDP training.')
+    parser.add_argument(
         '--model-type',
         type=str,
         default="conformer",
@@ -534,9 +546,8 @@ def get_parser():
     return parser
 
 
-def main():
-    global args
-    args = get_parser().parse_args()
+def run(rank, world_size, args):
+    
     model_type = args.model_type
     start_epoch = args.start_epoch
     num_epochs = args.num_epochs
@@ -547,9 +558,15 @@ def main():
 
     fix_random_seed(42)
 
+    setup_dist(rank, world_size, args.master_port)
+
     exp_dir = Path(args.exp)
-    setup_logger('{}/log/log-train'.format(exp_dir))
-    tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard') if args.tensorboard else None
+    setup_logger('{}/log/log-train-{}'.format(exp_dir, rank))
+    if args.tensorboard and rank == 0:
+        tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
+    else:
+        tb_writer = None
+
 
     # load L, G, symbol_table
     lang_dir = Path('data/lang_nosp')
@@ -567,7 +584,7 @@ def main():
             L_inv = k2.arc_sort(L.invert_())
             torch.save(L_inv.as_dict(), lang_dir / 'Linv.pt')
 
-    device_id = 0
+    device_id = rank
     device = torch.device('cuda', device_id)
 
     graph_compiler = MmiTrainingGraphCompiler(
@@ -734,6 +751,8 @@ def main():
     model.to(device)
     describe(model)
 
+    model = DDP(model, device_ids=[rank])
+    
     optimizer = Noam(model.parameters(),
                      model_size=args.attention_dim,
                      factor=1.0,
@@ -791,7 +810,8 @@ def main():
                             learning_rate=curr_learning_rate,
                             objf=objf,
                             valid_objf=valid_objf,
-                            global_batch_idx_train=global_batch_idx_train)
+                            global_batch_idx_train=global_batch_idx_train,
+                            local_rank=rank)
             save_training_info(filename=best_epoch_info_filename,
                                model_path=best_model_path,
                                current_epoch=epoch,
@@ -800,7 +820,8 @@ def main():
                                best_objf=best_objf,
                                valid_objf=valid_objf,
                                best_valid_objf=best_valid_objf,
-                               best_epoch=best_epoch)
+                               best_epoch=best_epoch,
+                               local_rank=rank)
 
         # we always save the model for every epoch
         model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(epoch))
@@ -812,7 +833,8 @@ def main():
                         learning_rate=curr_learning_rate,
                         objf=objf,
                         valid_objf=valid_objf,
-                        global_batch_idx_train=global_batch_idx_train)
+                        global_batch_idx_train=global_batch_idx_train,
+                        local_rank=rank)
         epoch_info_filename = os.path.join(exp_dir, 'epoch-{}-info'.format(epoch))
         save_training_info(filename=epoch_info_filename,
                            model_path=model_path,
@@ -822,10 +844,22 @@ def main():
                            best_objf=best_objf,
                            valid_objf=valid_objf,
                            best_valid_objf=best_valid_objf,
-                           best_epoch=best_epoch)
+                           best_epoch=best_epoch,
+                           local_rank=rank)
 
     logging.warning('Done')
+    torch.distributed.barrier()
+    cleanup_dist()
 
+
+def main():
+    parser = get_parser()
+    global args
+    args = parser.parse_args()
+    world_size = args.world_size
+    assert world_size >= 1
+    mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+                            
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)

@@ -77,12 +77,20 @@ if [ $stage -le 6 ]; then
   # 		      --num-epochs 3 \
   #                     --max-duration 100
   eps=0.001
-  
-  CUDA_VISIBLE_DEVICES=$(free-gpu) python3 ./mmi_att_transformer_train_adv.py \
-  		      --full-libri true \
+  exp_dir=exp/adv-fgsm-$eps-ddp2
+  # CUDA_VISIBLE_DEVICES=$(free-gpu) python3 ./mmi_att_transformer_train_adv.py \
+  # 		      --full-libri true \
+  # 		      --raw true \
+  # 		      --num-epochs 3 \
+  #                     --max-duration 100 \
+  # 		      --fgsm-eps $eps \
+  # 		      --exp exp/adv-$eps
+
+  CUDA_VISIBLE_DEVICES=$(free-gpu -n2) python3 ./mmi_att_transformer_train_adv.py \
+		      --world-size 2 \
   		      --raw true \
   		      --num-epochs 3 \
-                      --max-duration 100 \
+                      --max-duration 400 \
 		      --fgsm-eps $eps \
 		      --exp exp/adv-$eps
 fi
