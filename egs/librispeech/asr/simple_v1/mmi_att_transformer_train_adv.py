@@ -14,10 +14,12 @@ import numpy as np
 import os
 import sys
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_value_
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Optional, Tuple
@@ -27,52 +29,21 @@ from lhotse.dataset import BucketingSampler, CutConcatenate, CutMix, K2SpeechRec
     SpecAugment
 from lhotse.dataset.cut_transforms.perturb_speed import PerturbSpeed
 from lhotse.dataset.input_strategies import OnTheFlyFeatures, AudioSamples
-from lhotse.utils import fix_random_seed
+from lhotse.utils import fix_random_seed, nullcontext
 from snowfall.common import describe, str2bool
 from snowfall.common import load_checkpoint, save_checkpoint
 from snowfall.common import save_training_info
 from snowfall.common import setup_logger
+from snowfall.lexicon import Lexicon
 from snowfall.dist import cleanup_dist, setup_dist
 from snowfall.models import AcousticModel
 from snowfall.models.conformer import Conformer
 from snowfall.models.transformer import Noam, Transformer
+from snowfall.objectives import LFMMILoss
 from snowfall.training.diagnostics import measure_gradient_norms, optim_step_and_measure_param_change
 from snowfall.training.mmi_graph import MmiTrainingGraphCompiler
 from snowfall.training.mmi_graph import create_bigram_phone_lm
 from snowfall.training.mmi_graph import get_phone_symbols
-
-
-def get_tot_objf_and_num_frames(tot_scores: torch.Tensor,
-                                frames_per_seq: torch.Tensor
-                                ) -> Tuple[float, int, int]:
-    ''' Figures out the total score(log-prob) over all successful supervision segments
-    (i.e. those for which the total score wasn't -infinity), and the corresponding
-    number of frames of neural net output
-         Args:
-            tot_scores: a Torch tensor of shape (num_segments,) containing total scores
-                       from forward-backward
-        frames_per_seq: a Torch tensor of shape (num_segments,) containing the number of
-                       frames for each segment
-        Returns:
-             Returns a tuple of 3 scalar tensors:  (tot_score, ok_frames, all_frames)
-        where ok_frames is the frames for successful (finite) segments, and
-       all_frames is the frames for all segments (finite or not).
-    '''
-    mask = torch.ne(tot_scores, -math.inf)
-    # finite_indexes is a tensor containing successful segment indexes, e.g.
-    # [ 0 1 3 4 5 ]
-    finite_indexes = torch.nonzero(mask).squeeze(1)
-    if False:
-        bad_indexes = torch.nonzero(~mask).squeeze(1)
-        if bad_indexes.shape[0] > 0:
-            print("Bad indexes: ", bad_indexes, ", bad lengths: ",
-                  frames_per_seq[bad_indexes], " vs. max length ",
-                  torch.max(frames_per_seq), ", avg ",
-                  (torch.sum(frames_per_seq) / frames_per_seq.numel()))
-    # print("finite_indexes = ", finite_indexes, ", tot_scores = ", tot_scores)
-    ok_frames = frames_per_seq[finite_indexes].sum()
-    all_frames = frames_per_seq.sum()
-    return (tot_scores[finite_indexes].sum(), ok_frames, all_frames)
 
 
 def feature_extraction(x: torch.Tensor,
@@ -120,62 +91,53 @@ def forward_pass(feature,
                  texts,
                  P,
                  model,
+                 ali_model,
                  device,
                  den_scale,
                  att_rate,
                  graph_compiler,
-                 is_training):
+                 is_training,
+                 global_batch_idx_train):
     feature = feature.to(device)
     # at entry, feature is [N, T, C]
     feature = feature.permute(0, 2, 1)  # now feature is [N, C, T]
-    if is_training:
+
+    loss_fn = LFMMILoss(
+        graph_compiler=graph_compiler,
+        P=P,
+        den_scale=den_scale
+    )
+    grad_context = nullcontext if is_training else torch.no_grad
+    with grad_context():
         nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
         if att_rate != 0.0:
             att_loss = model.decoder_forward(encoder_memory, memory_mask, supervisions, graph_compiler)
-    else:
+    if (ali_model is not None and global_batch_idx_train is not None and
+        global_batch_idx_train < 4000):
         with torch.no_grad():
-            nnet_output, encoder_memory, memory_mask = model(feature, supervisions)
-            if att_rate != 0.0:
-                att_loss = model.decoder_forward(encoder_memory, memory_mask, supervisions, graph_compiler)
+            ali_model_output = ali_model(feature)[0]
+        ali_model_scale = 500.0 / (global_batch_idx_train + 500)
+        nnet_output = nnet_output.clone()  # or log-softmax backprop will fail.
+        nnet_output += ali_model_scale * ali_model_output
+            
     # nnet_output is [N, C, T]
     nnet_output = nnet_output.permute(0, 2, 1)  # now nnet_output is [N, T, C]
 
-    dense_fsa_vec = k2.DenseFsaVec(nnet_output, supervision_segments)
+    mmi_loss, tot_frames, all_frames = loss_fn(nnet_output, texts, supervision_segments)
+    
+    # dense_fsa_vec = k2.DenseFsaVec(nnet_output, supervision_segments)
     assert nnet_output.device == device
 
-    if is_training:
-        num, den = graph_compiler.compile(texts, P)
-    else:
-        with torch.no_grad():
-            num, den = graph_compiler.compile(texts, P)
-
-    assert num.requires_grad == is_training
-    assert den.requires_grad is False
-    num = num.to(device)
-    den = den.to(device)
-    
-    num = k2.intersect_dense(num, dense_fsa_vec, 10.0)
-    den = k2.intersect_dense(den, dense_fsa_vec, 10.0)
-
-    num_tot_scores = num.get_tot_scores(
-        log_semiring=True,
-        use_double_scores=True)
-    den_tot_scores = den.get_tot_scores(
-        log_semiring=True,
-        use_double_scores=True)
-    tot_scores = num_tot_scores - den_scale * den_tot_scores
-
-    (tot_score, tot_frames,
-     all_frames) = get_tot_objf_and_num_frames(tot_scores,
-                                               supervision_segments[:, 2])
     if att_rate != 0.0:
-        loss = (- (1.0 - att_rate) * tot_score + att_rate * att_loss) / (supervision_segments.shape[0] * 1)
+        loss = (- (1.0 - att_rate) * mmi_loss + att_rate * att_loss) / (len(texts))
     else:
-        loss = (-tot_score) / (supervision_segments.shape[0] * 1)
-    return loss, tot_score, tot_frames, all_frames
+        loss = (-mmi_loss) / (len(texts))
+
+    return loss, tot_frames, all_frames
 
 def get_objf(batch: Dict,
              model: AcousticModel,
+             ali_model: Optional[AcousticModel],
              P: k2.Fsa,
              device: torch.device,
              graph_compiler: MmiTrainingGraphCompiler,
@@ -186,10 +148,12 @@ def get_objf(batch: Dict,
              att_rate: float = 0.0,
              tb_writer: Optional[SummaryWriter] = None,
              global_batch_idx_train: Optional[int] = None,
-             optimizer: Optional[torch.optim.Optimizer] = None):
+             optimizer: Optional[torch.optim.Optimizer] = None,
+             args=None):
     audio = batch['inputs']
     supervisions = batch['supervisions']
-    feature, supervisions = feature_extraction(audio, supervisions, True)
+    input_grad = False if not args.adv else True
+    feature, supervisions = feature_extraction(audio, supervisions, input_grad)
     supervision_segments = torch.stack(
         (supervisions['sequence_idx'],
          (((supervisions['start_frame'] - 1) // 2 - 1) // 2),
@@ -201,66 +165,135 @@ def get_objf(batch: Dict,
     texts = supervisions['text']
     texts = [texts[idx] for idx in indices]
 
-    loss, tot_score, tot_frames, all_frames = forward_pass(feature, supervisions,
-                                                           supervision_segments,
-                                                           texts, P, model,
-                                                           device, den_scale,
-                                                           att_rate, graph_compiler,
-                                                           is_training)
+    loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+                                                supervision_segments,
+                                                texts, P, model,
+                                                ali_model,
+                                                device, den_scale,
+                                                att_rate, graph_compiler,
+                                                is_training,
+                                                global_batch_idx_train)
     if is_training:
-        def maybe_log_gradients(tag: str):
-            if tb_writer is not None and global_batch_idx_train is not None and global_batch_idx_train % 200 == 0:
-                tb_writer.add_scalars(
-                    tag,
-                    measure_gradient_norms(model, norm='l1'),
-                    global_step=global_batch_idx_train
-                )
+        # def maybe_log_gradients(tag: str):
+        #     if tb_writer is not None and global_batch_idx_train is not None and global_batch_idx_train % 200 == 0:
+        #         tb_writer.add_scalars(
+        #             tag,
+        #             measure_gradient_norms(model, norm='l1'),
+        #             global_step=global_batch_idx_train
+        #         )
 
-        # FGSM attack block
-        loss.backward() # to get input gradients
-        optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
-        assert audio.grad is not None
-        audio_adv = audio + audio.grad.data.sign() * args.fgsm_eps * audio.abs().max()
-        audio = audio_adv.detach()
-        feature, _ = feature_extraction(audio, None, False)
-        loss, tot_score, tot_frames, all_frames = forward_pass(feature, supervisions,
-                                                               supervision_segments,
-                                                               texts, P, model,
-                                                               device, den_scale,
-                                                               att_rate, graph_compiler,
-                                                               is_training)
+        # adversarial attack block
+        if args.adv is not None:
+            if args.adv == 'fgsm':
+                loss.backward() # to get input gradients
+                optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
+                assert audio.grad is not None
+                audio_adv = audio + audio.grad.data.sign() * args.fgsm_eps * audio.abs().max()
+                audio = audio_adv.detach()
+                feature, _ = feature_extraction(audio, None, False)
+                loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+                                                            supervision_segments,
+                                                            texts, P, model,
+                                                            ali_model,
+                                                            device, den_scale,
+                                                            att_rate, graph_compiler,
+                                                            is_training,
+                                                            global_batch_idx_train)
+            if args.adv == 'pgd':
+                audio_ori = audio
+                for i in range(args.pgd_iter):
+                    loss.backward() # to get input gradients
+                    optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
+                    assert audio.grad is not None
+                    audio_adv = audio + audio.grad.data.sign() * args.pgd_alpha * audio.abs().max()
+                    eps = args.pgd_eps * audio.abs().max().data
+                    eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
+                    audio = (audio_ori + eta).detach()
+                    audio_require_grad = False if i == args.pgd_iter - 1 else True
+                    feature, _ = feature_extraction(audio, None, audio_require_grad)
+                    loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+                                                                supervision_segments,
+                                                                texts, P, model,
+                                                                ali_model,
+                                                                device, den_scale,
+                                                                att_rate, graph_compiler,
+                                                                is_training,
+                                                                global_batch_idx_train)
 
+            if args.adv == 'free':
+                audio_ori = audio
+                for i in range(args.pgd_iter):
+                    loss.backward() # to get input gradients
+                    #maybe_log_gradients('train/grad_norms')
+                    clip_grad_value_(model.parameters(), 5.0)
+                    #maybe_log_gradients('train/clipped_grad_norms')
+                    # if tb_writer is not None and (global_batch_idx_train // accum_grad) % 200 == 0:
+                    #     # Once in a time we will perform a more costly diagnostic
+                    #     # to check the relative parameter change per minibatch.
+                    #     deltas = optim_step_and_measure_param_change(model, optimizer)
+                    #     tb_writer.add_scalars(
+                    #         'train/relative_param_change_per_minibatch',
+                    #         deltas,
+                    #         global_step=global_batch_idx_train
+                    #     )
+                    # else:
+                    #     optimizer.step()
+                    optimizer.step()
+                    
+                    optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
+                    assert audio.grad is not None
+                    #perb = audio.grad.data.sign() * args.pgd_eps * audio.abs().max()
+                    audio_adv = audio + audio.grad.data.sign() * args.pgd_eps * audio.abs().max()
+                    eps = args.pgd_eps * audio.abs().max().data
+                    eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
+                    audio = (audio_ori + eta).detach()
+                    audio_require_grad = False if i == args.pgd_iter - 1 else True
+                    feature, _ = feature_extraction(audio, None, audio_require_grad)
+                    loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+                                                                supervision_segments,
+                                                                texts, P, model,
+                                                                ali_model,
+                                                                device, den_scale,
+                                                                att_rate, graph_compiler,
+                                                                is_training,
+                                                                global_batch_idx_train)
+                
         # actual backward pass
         loss.backward()
         
         if is_update:
-            maybe_log_gradients('train/grad_norms')
+            # maybe_log_gradients('train/grad_norms')
+            # clip_grad_value_(model.parameters(), 5.0)
+            # maybe_log_gradients('train/clipped_grad_norms')
+            # if tb_writer is not None and (global_batch_idx_train // accum_grad) % 200 == 0:
+            #     # Once in a time we will perform a more costly diagnostic
+            #     # to check the relative parameter change per minibatch.
+            #     deltas = optim_step_and_measure_param_change(model, optimizer)
+            #     tb_writer.add_scalars(
+            #         'train/relative_param_change_per_minibatch',
+            #         deltas,
+            #         global_step=global_batch_idx_train
+            #     )
+            # else:
+            #     optimizer.step()
             clip_grad_value_(model.parameters(), 5.0)
-            maybe_log_gradients('train/clipped_grad_norms')
-            if tb_writer is not None and (global_batch_idx_train // accum_grad) % 200 == 0:
-                # Once in a time we will perform a more costly diagnostic
-                # to check the relative parameter change per minibatch.
-                deltas = optim_step_and_measure_param_change(model, optimizer)
-                tb_writer.add_scalars(
-                    'train/relative_param_change_per_minibatch',
-                    deltas,
-                    global_step=global_batch_idx_train
-                )
-            else:
-                optimizer.step()
+            optimizer.step()
+            
             optimizer.zero_grad()
 
-    ans = -tot_score.detach().cpu().item(), tot_frames.cpu().item(
+    ans = loss.detach().cpu().item(), tot_frames.cpu().item(
     ), all_frames.cpu().item()
     return ans
 
 
 def get_validation_objf(dataloader: torch.utils.data.DataLoader,
                         model: AcousticModel,
+                        ali_model: Optional[AcousticModel],
                         P: k2.Fsa,
                         device: torch.device,
                         graph_compiler: MmiTrainingGraphCompiler,
-                        den_scale: float = 1
+                        den_scale: float = 1,
+                        args=None
                         ):
     total_objf = 0.
     total_frames = 0.  # for display only
@@ -273,16 +306,20 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
         objf, frames, all_frames = get_objf(
             batch=batch,
             model=model,
+            ali_model=ali_model,
             P=P,
             device=device,
             graph_compiler=graph_compiler,
             is_training=False,
             is_update=False,
-            den_scale=den_scale
+            den_scale=den_scale,
+            args=args
         )
         total_objf += objf
         total_frames += frames
         total_all_frames += all_frames
+        # if batch_idx == 10:
+        #     break
 
     return total_objf, total_frames, total_all_frames
 
@@ -290,6 +327,7 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
 def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                     valid_dataloader: torch.utils.data.DataLoader,
                     model: AcousticModel, P: k2.Fsa,
+                    ali_model: Optional[AcousticModel],
                     device: torch.device,
                     graph_compiler: MmiTrainingGraphCompiler,
                     optimizer: torch.optim.Optimizer,
@@ -299,7 +337,9 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                     current_epoch: int,
                     tb_writer: SummaryWriter,
                     num_epochs: int,
-                    global_batch_idx_train: int):
+                    global_batch_idx_train: int,
+                    world_size: int,
+                    args=None):
     """One epoch training and validation.
 
     Args:
@@ -344,12 +384,13 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
         time_waiting_for_batch += (timestamp - prev_timestamp).total_seconds()
 
         if forward_count == 1 or accum_grad == 1:
-            P.set_scores_stochastic_(model.P_scores)
+            P.set_scores_stochastic_(model.module.P_scores)
             assert P.requires_grad is True
 
         curr_batch_objf, curr_batch_frames, curr_batch_all_frames = get_objf(
             batch=batch,
             model=model,
+            ali_model=ali_model,
             P=P,
             device=device,
             graph_compiler=graph_compiler,
@@ -360,7 +401,8 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
             att_rate=att_rate,
             tb_writer=tb_writer,
             global_batch_idx_train=global_batch_idx_train,
-            optimizer=optimizer
+            optimizer=optimizer,
+            args=args
         )
 
         total_objf += curr_batch_objf
@@ -393,9 +435,20 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
             total_valid_objf, total_valid_frames, total_valid_all_frames = get_validation_objf(
                 dataloader=valid_dataloader,
                 model=model,
+                ali_model=ali_model,
                 P=P,
                 device=device,
-                graph_compiler=graph_compiler)
+                graph_compiler=graph_compiler,
+                args=args)
+            if world_size > 1:
+                s = torch.tensor([
+                    total_valid_objf, total_valid_frames,
+                    total_valid_all_frames
+                ]).to(device)
+                
+                dist.all_reduce(s, op=dist.ReduceOp.SUM)
+                total_valid_objf, total_valid_frames, total_valid_all_frames = s.cpu().tolist()
+                                                                
             valid_average_objf = total_valid_objf / total_valid_frames
             model.train()
             logging.info(
@@ -408,7 +461,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                 tb_writer.add_scalar('train/global_valid_average_objf',
                                      valid_average_objf,
                                      global_batch_idx_train)
-                model.write_tensorboard_diagnostics(tb_writer, global_step=global_batch_idx_train)
+                # model.module.write_tensorboard_diagnostics(tb_writer, global_step=global_batch_idx_train)
         prev_timestamp = datetime.now()
     return total_objf / total_frames, valid_average_objf, global_batch_idx_train
 
@@ -522,7 +575,7 @@ def get_parser():
     parser.add_argument(
         '--tensorboard',
         type=str2bool,
-        default=False,
+        default=True,
         help='Should various information be logged in tensorboard.'
     )
     parser.add_argument(
@@ -532,24 +585,75 @@ def get_parser():
         help='Use audio samples as inputs'
     )
     parser.add_argument(
+        '--adv',
+        type=str,
+        default=None,
+        help='Adversarial training methods'
+    )
+    parser.add_argument(
         '--fgsm-eps',
         type=float,
         default=0.0,
         help='FGSM attack eps'
     )
     parser.add_argument(
+        '--pgd-iter',
+        type=int,
+        default=7,
+        help='Number of PGD iterations'
+    )
+    parser.add_argument(
+        '--pgd-eps',
+        type=float,
+        default=0.0,
+        help='PGD attack eps'
+    )
+    parser.add_argument(
+        '--pgd-alpha',
+        type=float,
+        default=0.0,
+        help='PGD attack alpha'
+    )
+    parser.add_argument(
+        '--finetune-checkpoint',
+        type=str,
+        default=None,
+        help='finetune model checkpoint path')
+    parser.add_argument(
+        '--ali-model',
+        type=str,
+        default=None,
+        help='alignment model path')
+    parser.add_argument(
         '--exp',
         type=str,
         required=True,
         help='exp directory'
-        )
+    )
+    parser.add_argument(
+        '--musan',
+        type=bool,
+        default=False,
+        help='When enabled, do MUSAN noise data-augmentation'
+    )
     return parser
 
 
 def run(rank, world_size, args):
-    
+    '''
+    Args:
+      rank:
+        It is a value between 0 and `world_size-1`, which is
+        passed automatically by `mp.spawn()` in :func:`main`.
+        The node with rank 0 is responsible for saving checkpoint.
+      world_size:
+        Number of GPUs for DDP training.
+      args:
+        The return value of get_parser().parse_args()
+    '''
     model_type = args.model_type
     start_epoch = args.start_epoch
+    finetune_checkpoint = args.finetune_checkpoint
     num_epochs = args.num_epochs
     max_duration = args.max_duration
     accum_grad = args.accum_grad
@@ -560,46 +664,33 @@ def run(rank, world_size, args):
 
     setup_dist(rank, world_size, args.master_port)
 
+    device_id = rank
+    device = torch.device('cuda', device_id)
+
     exp_dir = Path(args.exp)
-    setup_logger('{}/log/log-train-{}'.format(exp_dir, rank))
+    setup_logger(f'{exp_dir}/log/log-train-{rank}')
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
     else:
         tb_writer = None
 
 
-    # load L, G, symbol_table
+    logging.info("Loading lexicon and symbol tables")
     lang_dir = Path('data/lang_nosp')
-    phone_symbol_table = k2.SymbolTable.from_file(lang_dir / 'phones.txt')
-    word_symbol_table = k2.SymbolTable.from_file(lang_dir / 'words.txt')
-
-    logging.info(args)
-    
-    logging.info("Loading L.fst")
-    if (lang_dir / 'Linv.pt').exists():
-        L_inv = k2.Fsa.from_dict(torch.load(lang_dir / 'Linv.pt'))
-    else:
-        with open(lang_dir / 'L.fst.txt') as f:
-            L = k2.Fsa.from_openfst(f.read(), acceptor=False)
-            L_inv = k2.arc_sort(L.invert_())
-            torch.save(L_inv.as_dict(), lang_dir / 'Linv.pt')
-
-    device_id = rank
-    device = torch.device('cuda', device_id)
+    lexicon = Lexicon(lang_dir)
 
     graph_compiler = MmiTrainingGraphCompiler(
-        L_inv=L_inv,
-        phones=phone_symbol_table,
-        words=word_symbol_table,
+        lexicon=lexicon,
         device=device,
     )
-    phone_ids = get_phone_symbols(phone_symbol_table)
+    phone_ids = lexicon.phone_symbols()
+
     P = create_bigram_phone_lm(phone_ids)
     P.scores = torch.zeros_like(P.scores)
     P = P.to(device)
 
     # load dataset
-    feature_dir = Path('exp/data')
+    feature_dir = Path('exp/data_fast')
     logging.info("About to get train cuts")
     cuts_train = load_manifest(feature_dir / 'cuts_train-clean-100.json.gz')
     if args.full_libri:
@@ -613,11 +704,14 @@ def run(rank, world_size, args):
         load_manifest(feature_dir / 'cuts_dev-clean.json.gz') +
         load_manifest(feature_dir / 'cuts_dev-other.json.gz')
     )
-    logging.info("About to get Musan cuts")
-    cuts_musan = load_manifest(feature_dir / 'cuts_musan.json.gz')
 
-    logging.info("About to create train dataset")
-    transforms = [CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20))]
+    transforms = []
+    if args.musan:
+        logging.info("About to get Musan cuts")
+        cuts_musan = load_manifest(feature_dir / 'cuts_musan.json.gz')
+        logging.info("About to create train dataset")
+        transforms = [CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20))]
+        
     if args.concatenate_cuts:
         logging.info(f'Using cut concatenation with duration factor {args.duration_factor} and gap {args.gap}.')
         # Cut concatenation should be the first transform in the list,
@@ -644,6 +738,7 @@ def run(rank, world_size, args):
         )
     elif args.raw:
         cuts_train = cuts_train.drop_features()
+        # specaug is not used on raw audio
         train = K2SpeechRecognitionDataset(
             cuts=cuts_train,
             cut_transforms=transforms,
@@ -673,11 +768,6 @@ def run(rank, world_size, args):
             max_duration=max_duration,
             shuffle=True,
         )
-        # train_sampler = SingleCutSampler(
-        #     cuts_train,
-        #     max_cuts=10,
-        #     shuffle=True,
-        # )
     logging.info("About to create train dataloader")
     train_dl = torch.utils.data.DataLoader(
         train,
@@ -705,17 +795,12 @@ def run(rank, world_size, args):
         cuts_dev,
         max_duration=max_duration-20,
     )
-    # valid_sampler = SingleCutSampler(
-    #     cuts_dev,
-    #     max_cuts=10,
-    #     shuffle=True,
-    # )
     logging.info("About to create dev dataloader")
     valid_dl = torch.utils.data.DataLoader(
         validate,
         sampler=valid_sampler,
         batch_size=None,
-        num_workers=1
+        num_workers=4
     )
 
     if not torch.cuda.is_available():
@@ -750,8 +835,6 @@ def run(rank, world_size, args):
 
     model.to(device)
     describe(model)
-
-    model = DDP(model, device_ids=[rank])
     
     optimizer = Noam(model.parameters(),
                      model_size=args.attention_dim,
@@ -766,12 +849,39 @@ def run(rank, world_size, args):
     global_batch_idx_train = 0  # for logging only
 
     if start_epoch > 0:
-        model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(start_epoch - 1))
+        if finetune_checkpoint is None:
+            model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(start_epoch - 1))
+        else:
+            # finetune on other models
+            model_path = finetune_checkpoint
         ckpt = load_checkpoint(filename=model_path, model=model, optimizer=optimizer)
         best_objf = ckpt['objf']
         best_valid_objf = ckpt['valid_objf']
         global_batch_idx_train = ckpt['global_batch_idx_train']
         logging.info(f"epoch = {ckpt['epoch']}, objf = {best_objf}, valid_objf = {best_valid_objf}")
+
+    model = DDP(model, device_ids=[rank])
+
+    # Now for the aligment model, if any
+    if args.ali_model is not None:
+        ali_model = Conformer(
+            num_features=80,
+            nhead=args.nhead,
+            d_model=args.attention_dim,
+            num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
+            subsampling_factor=4,
+            num_decoder_layers=num_decoder_layers)
+        ali_model.P_scores = nn.Parameter(P.scores.clone(), requires_grad=False)
+        ali_model.load_state_dict(torch.load(args.ali_model, map_location='cpu')['state_dict'])
+        ali_model.to(device)
+        
+        ali_model.eval()
+        ali_model.requires_grad_(False)
+        logging.info(f'Use ali_model: {args.ali_model}')
+    else:
+        ali_model = None
+        logging.info('No ali_model')
+                            
 
     for epoch in range(start_epoch, num_epochs):
         train_sampler.set_epoch(epoch)
@@ -785,6 +895,7 @@ def run(rank, world_size, args):
             dataloader=train_dl,
             valid_dataloader=valid_dl,
             model=model,
+            ali_model=ali_model,
             P=P,
             device=device,
             graph_compiler=graph_compiler,
@@ -796,6 +907,8 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             num_epochs=num_epochs,
             global_batch_idx_train=global_batch_idx_train,
+            world_size=world_size,
+            args=args
         )
         # the lower, the better
         if valid_objf < best_valid_objf:
@@ -854,13 +967,12 @@ def run(rank, world_size, args):
 
 def main():
     parser = get_parser()
-    global args
     args = parser.parse_args()
     world_size = args.world_size
     assert world_size >= 1
     mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
                             
-
+logging.info = print
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
