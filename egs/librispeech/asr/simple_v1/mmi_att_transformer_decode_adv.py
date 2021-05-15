@@ -28,6 +28,7 @@ from snowfall.data import LibriSpeechAsrDataModule
 from snowfall.decoding.graph import compile_HLG
 from snowfall.models import AcousticModel
 from snowfall.models.transformer import Transformer
+from snowfall.models.contextnet import ContextNet
 from snowfall.models.conformer import Conformer
 from snowfall.training.ctc_graph import build_ctc_topo
 from snowfall.training.mmi_graph import create_bigram_phone_lm
@@ -163,7 +164,7 @@ def get_parser():
         '--model-type',
         type=str,
         default="conformer",
-        choices=["transformer", "conformer"],
+        choices=["transformer", "conformer", "contextnet"],
         help="Model type.")
     parser.add_argument(
         '--epoch',
@@ -248,7 +249,7 @@ def main():
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers)
-    else:
+    elif model_type == "conformer":
         model = Conformer(
             num_features=80,
             nhead=args.nhead,
@@ -256,6 +257,10 @@ def main():
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers)
+    elif model_type == "contextnet":
+        model = ContextNet(
+            num_features=80,
+            num_classes=len(phone_ids) + 1) # +1 for the blank symbol
 
     model.P_scores = torch.nn.Parameter(P.scores.clone(), requires_grad=False)
 
@@ -307,7 +312,8 @@ def main():
     feature_dir = Path('exp/data_fast')
     #test_sets = ['test-clean', 'test-other']
     if args.dataset == 'test':
-        test_sets = ['test-clean'],
+        #test_sets = ['test-clean', 'test-other']
+        test_sets = ['test-clean']
     else:
         test_sets = ['train-clean-100']
     from lhotse.dataset.input_strategies import OnTheFlyFeatures

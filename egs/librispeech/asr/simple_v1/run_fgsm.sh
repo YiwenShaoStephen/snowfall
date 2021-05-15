@@ -16,29 +16,25 @@ ngpu=1
 cmd="$cuda_cmd --gpu $ngpu"
 
 eps=0.01
-iter=2
-alpha=$(echo $eps $iter | awk '{ print $1 * 1.5 / $2}') # alpha = 1.5 * eps / iter
-exp_dir=exp/adv-pgd-$iter-$eps-full
+exp_dir=exp/adv-fgsm-$eps
 mkdir -p $exp_dir
 if [ $stage -le 1 ]; then
   #CUDA_VISIBLE_DEVICES=$(free-gpu -n $ngpu) python3 ./mmi_att_transformer_train_adv.py \
   $cmd $exp_dir/train.log ./mmi_att_transformer_train_adv.py \
   		      --world-size $ngpu \
   		      --raw true \
-		      --full-libri true \
+		      --full-libri false \
   		      --num-epochs 20 \
                       --max-duration 120 \
-		      --adv pgd \
-		      --pgd-iter $iter \
-  		      --pgd-eps $eps \
-		      --pgd-alpha $alpha \
-  		      --exp $exp_dir | tee -a $exp_dir/log.txt
+		      --adv fgsm \
+  		      --fgsm-eps $eps \
+  		      --exp $exp_dir
 fi
 
 if [ $stage -le 2 ] && [ $stop_stage -gt 2 ]; then
   #CUDA_VISIBLE_DEVICES=$(free-gpu) python3 ./mmi_att_transformer_decode_adv.py \
   $cmd $exp_dir/decode.log ./mmi_att_transformer_decode_adv.py \
-		      --epoch 1 \
+		      --epoch 7 \
 		      --avg 1 \
 		      --max-duration 100 \
 		      --exp $exp_dir \

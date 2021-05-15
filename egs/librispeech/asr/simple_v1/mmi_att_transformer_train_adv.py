@@ -39,6 +39,7 @@ from snowfall.dist import cleanup_dist, setup_dist
 from snowfall.models import AcousticModel
 from snowfall.models.conformer import Conformer
 from snowfall.models.transformer import Noam, Transformer
+from snowfall.models.contextnet import ContextNet
 from snowfall.objectives import LFMMILoss
 from snowfall.training.diagnostics import measure_gradient_norms, optim_step_and_measure_param_change
 from snowfall.training.mmi_graph import MmiTrainingGraphCompiler
@@ -135,6 +136,79 @@ def forward_pass(feature,
 
     return loss, tot_frames, all_frames
 
+def fgsm_attack(audio,
+                supervisions,
+                supervision_segments,
+                texts,
+                P,
+                model,
+                ali_model,
+                device,
+                den_scale,
+                att_rate,
+                graph_compiler,
+                is_training,
+                global_batch_idx_train,
+                eps=0.01):
+    eps = eps * audio.abs().max().data
+    feature, _ = feature_extraction(audio, compute_gradient=True)
+    loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+                                                supervision_segments,
+                                                texts, P, model,
+                                                ali_model,
+                                                device, den_scale,
+                                                att_rate, graph_compiler,
+                                                is_training,
+                                                global_batch_idx_train)
+    loss.backward() # to get input gradients
+    assert audio.grad is not None
+    audio_adv = audio + audio.grad.data.sign() * eps
+    audio = audio_adv.detach()
+    return audio
+
+def pgd_attack(audio,
+               supervisions,
+               supervision_segments,
+               texts,
+               P,
+               model,
+               ali_model,
+               device,
+               den_scale,
+               att_rate,
+               graph_compiler,
+               is_training,
+               global_batch_idx_train,
+               eps=0.01,
+               alpha=0.002,
+               iters=7,
+               rand_prob=0.8):
+    audio_ori = audio
+    eps = eps * audio.abs().max().data
+    alpha = alpha * audio.abs().max().data
+    if torch.rand(1) < rand_prob:
+        rand_pert = torch.rand_like(audio) * 2 * eps - eps
+        audio = audio + rand_pert
+    for i in range(iters):
+        feature, _ = feature_extraction(audio, compute_gradient=True)
+        loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+                                                    supervision_segments,
+                                                    texts, P, model,
+                                                    ali_model,
+                                                    device, den_scale,
+                                                    att_rate, graph_compiler,
+                                                    is_training,
+                                                    global_batch_idx_train)
+        loss.backward() # to get input gradients
+        assert audio.grad is not None
+        audio_adv = audio + audio.grad.data.sign() * alpha
+        eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
+        audio = (audio_ori + eta).detach()
+
+    return audio
+        
+
+    
 def get_objf(batch: Dict,
              model: AcousticModel,
              ali_model: Optional[AcousticModel],
@@ -152,8 +226,7 @@ def get_objf(batch: Dict,
              args=None):
     audio = batch['inputs']
     supervisions = batch['supervisions']
-    input_grad = False if not args.adv else True
-    feature, supervisions = feature_extraction(audio, supervisions, input_grad)
+    _, supervisions = feature_extraction(audio, supervisions)
     supervision_segments = torch.stack(
         (supervisions['sequence_idx'],
          (((supervisions['start_frame'] - 1) // 2 - 1) // 2),
@@ -165,6 +238,90 @@ def get_objf(batch: Dict,
     texts = supervisions['text']
     texts = [texts[idx] for idx in indices]
 
+    if is_training:
+        # adversarial attack block
+        if args.adv is not None:
+            if args.adv == 'fgsm':
+                audio = fgsm_attack(audio, supervisions,
+                                    supervision_segments,
+                                    texts, P, model,
+                                    ali_model,
+                                    device, den_scale,
+                                    att_rate, graph_compiler,
+                                    is_training,
+                                    global_batch_idx_train,
+                                    eps=args.fgsm_eps)
+                optimizer.zero_grad() # clean up gradients in model that were generated from adversary
+                
+            if args.adv == 'pgd':
+                audio = pgd_attack(audio, supervisions,
+                                   supervision_segments,
+                                   texts, P, model,
+                                   ali_model,
+                                   device, den_scale,
+                                   att_rate, graph_compiler,
+                                   is_training,
+                                   global_batch_idx_train,
+                                   eps=args.pgd_eps,
+                                   alpha=args.pgd_alpha,
+                                   iters=args.pgd_iter,
+                                   rand_prob=args.pgd_rand_prob)
+                optimizer.zero_grad() # clean up gradients in model that were generated from adversary
+
+            # if args.adv == 'free':
+            #     audio_ori = audio
+            #     for i in range(args.pgd_iter):
+            #         loss.backward() # to get input gradients
+            #         #maybe_log_gradients('train/grad_norms')
+            #         clip_grad_value_(model.parameters(), 5.0)
+            #         optimizer.step()
+                    
+            #         optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
+            #         assert audio.grad is not None
+            #         #perb = audio.grad.data.sign() * args.pgd_eps * audio.abs().max()
+            #         audio_adv = audio + audio.grad.data.sign() * args.pgd_eps * audio.abs().max()
+            #         eps = args.pgd_eps * audio.abs().max().data
+            #         eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
+            #         audio = (audio_ori + eta).detach()
+            #         audio_require_grad = False if i == args.pgd_iter - 1 else True
+            #         feature, _ = feature_extraction(audio, None, audio_require_grad)
+            #         loss, tot_frames, all_frames = forward_pass(feature, supervisions,
+            #                                                     supervision_segments,
+            #                                                     texts, P, model,
+            #                                                     ali_model,
+            #                                                     device, den_scale,
+            #                                                     att_rate, graph_compiler,
+            #                                                     is_training,
+            #                                                     global_batch_idx_train)
+
+            if args.adv == 'm-pgd': # a mixture of clean samples and adversarial samples
+                audio_adv = pgd_attack(audio, supervisions,
+                                       supervision_segments,
+                                       texts, P, model,
+                                       ali_model,
+                                       device, den_scale,
+                                       att_rate, graph_compiler,
+                                       is_training,
+                                       global_batch_idx_train,
+                                       eps=args.pgd_eps,
+                                       alpha=args.pgd_alpha,
+                                       iters=args.pgd_iter,
+                                       rand_prob=args.pgd_rand_prob)
+                optimizer.zero_grad() # clean up gradients in model that were generated from adversary
+                feature_adv, _ = feature_extraction(audio_adv)
+                loss, tot_frames, all_frames = forward_pass(feature_adv, supervisions,
+                                                            supervision_segments,
+                                                            texts, P, model,
+                                                            ali_model,
+                                                            device, den_scale,
+                                                            att_rate, graph_compiler,
+                                                            is_training,
+                                                            global_batch_idx_train)
+                loss.backward()
+
+
+    # forward and backward for paramters update
+    feature, _ = feature_extraction(audio)
     loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                 supervision_segments,
                                                 texts, P, model,
@@ -174,112 +331,12 @@ def get_objf(batch: Dict,
                                                 is_training,
                                                 global_batch_idx_train)
     if is_training:
-        # def maybe_log_gradients(tag: str):
-        #     if tb_writer is not None and global_batch_idx_train is not None and global_batch_idx_train % 200 == 0:
-        #         tb_writer.add_scalars(
-        #             tag,
-        #             measure_gradient_norms(model, norm='l1'),
-        #             global_step=global_batch_idx_train
-        #         )
-
-        # adversarial attack block
-        if args.adv is not None:
-            if args.adv == 'fgsm':
-                loss.backward() # to get input gradients
-                optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
-                assert audio.grad is not None
-                audio_adv = audio + audio.grad.data.sign() * args.fgsm_eps * audio.abs().max()
-                audio = audio_adv.detach()
-                feature, _ = feature_extraction(audio, None, False)
-                loss, tot_frames, all_frames = forward_pass(feature, supervisions,
-                                                            supervision_segments,
-                                                            texts, P, model,
-                                                            ali_model,
-                                                            device, den_scale,
-                                                            att_rate, graph_compiler,
-                                                            is_training,
-                                                            global_batch_idx_train)
-            if args.adv == 'pgd':
-                audio_ori = audio
-                for i in range(args.pgd_iter):
-                    loss.backward() # to get input gradients
-                    optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
-                    assert audio.grad is not None
-                    audio_adv = audio + audio.grad.data.sign() * args.pgd_alpha * audio.abs().max()
-                    eps = args.pgd_eps * audio.abs().max().data
-                    eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
-                    audio = (audio_ori + eta).detach()
-                    audio_require_grad = False if i == args.pgd_iter - 1 else True
-                    feature, _ = feature_extraction(audio, None, audio_require_grad)
-                    loss, tot_frames, all_frames = forward_pass(feature, supervisions,
-                                                                supervision_segments,
-                                                                texts, P, model,
-                                                                ali_model,
-                                                                device, den_scale,
-                                                                att_rate, graph_compiler,
-                                                                is_training,
-                                                                global_batch_idx_train)
-
-            if args.adv == 'free':
-                audio_ori = audio
-                for i in range(args.pgd_iter):
-                    loss.backward() # to get input gradients
-                    #maybe_log_gradients('train/grad_norms')
-                    clip_grad_value_(model.parameters(), 5.0)
-                    #maybe_log_gradients('train/clipped_grad_norms')
-                    # if tb_writer is not None and (global_batch_idx_train // accum_grad) % 200 == 0:
-                    #     # Once in a time we will perform a more costly diagnostic
-                    #     # to check the relative parameter change per minibatch.
-                    #     deltas = optim_step_and_measure_param_change(model, optimizer)
-                    #     tb_writer.add_scalars(
-                    #         'train/relative_param_change_per_minibatch',
-                    #         deltas,
-                    #         global_step=global_batch_idx_train
-                    #     )
-                    # else:
-                    #     optimizer.step()
-                    optimizer.step()
-                    
-                    optimizer.zero_grad() # TODO: it doesn't work properly with accum_grad > 1
-                    assert audio.grad is not None
-                    #perb = audio.grad.data.sign() * args.pgd_eps * audio.abs().max()
-                    audio_adv = audio + audio.grad.data.sign() * args.pgd_eps * audio.abs().max()
-                    eps = args.pgd_eps * audio.abs().max().data
-                    eta = torch.clamp(audio_adv - audio_ori, min=-eps, max=eps)
-                    audio = (audio_ori + eta).detach()
-                    audio_require_grad = False if i == args.pgd_iter - 1 else True
-                    feature, _ = feature_extraction(audio, None, audio_require_grad)
-                    loss, tot_frames, all_frames = forward_pass(feature, supervisions,
-                                                                supervision_segments,
-                                                                texts, P, model,
-                                                                ali_model,
-                                                                device, den_scale,
-                                                                att_rate, graph_compiler,
-                                                                is_training,
-                                                                global_batch_idx_train)
-                
-        # actual backward pass
         loss.backward()
         
-        if is_update:
-            # maybe_log_gradients('train/grad_norms')
-            # clip_grad_value_(model.parameters(), 5.0)
-            # maybe_log_gradients('train/clipped_grad_norms')
-            # if tb_writer is not None and (global_batch_idx_train // accum_grad) % 200 == 0:
-            #     # Once in a time we will perform a more costly diagnostic
-            #     # to check the relative parameter change per minibatch.
-            #     deltas = optim_step_and_measure_param_change(model, optimizer)
-            #     tb_writer.add_scalars(
-            #         'train/relative_param_change_per_minibatch',
-            #         deltas,
-            #         global_step=global_batch_idx_train
-            #     )
-            # else:
-            #     optimizer.step()
-            clip_grad_value_(model.parameters(), 5.0)
-            optimizer.step()
-            
-            optimizer.zero_grad()
+    if is_update:
+        clip_grad_value_(model.parameters(), 5.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     ans = loss.detach().cpu().item(), tot_frames.cpu().item(
     ), all_frames.cpu().item()
@@ -482,7 +539,7 @@ def get_parser():
         '--model-type',
         type=str,
         default="conformer",
-        choices=["transformer", "conformer"],
+        choices=["transformer", "conformer", "contextnet"],
         help="Model type.")
     parser.add_argument(
         '--num-epochs',
@@ -615,10 +672,15 @@ def get_parser():
         help='PGD attack alpha'
     )
     parser.add_argument(
-        '--finetune-checkpoint',
+        '--pgd-rand-prob',
+        type=float,
+        default=0.8,
+        help='PGD attack random initialization prob')
+    parser.add_argument(
+        '--finetune-dir',
         type=str,
         default=None,
-        help='finetune model checkpoint path')
+        help='finetune model checkpoint dir')
     parser.add_argument(
         '--ali-model',
         type=str,
@@ -635,6 +697,12 @@ def get_parser():
         type=bool,
         default=False,
         help='When enabled, do MUSAN noise data-augmentation'
+    )
+    parser.add_argument(
+        '--factor',
+        type=float,
+        default=1.0,
+        help='learning rate factor of Noam optimizer'
     )
     return parser
 
@@ -653,7 +721,7 @@ def run(rank, world_size, args):
     '''
     model_type = args.model_type
     start_epoch = args.start_epoch
-    finetune_checkpoint = args.finetune_checkpoint
+    finetune_dir = args.finetune_dir
     num_epochs = args.num_epochs
     max_duration = args.max_duration
     accum_grad = args.accum_grad
@@ -822,7 +890,7 @@ def run(rank, world_size, args):
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers)
-    else:
+    if model_type == 'conformer':
         model = Conformer(
             num_features=80,
             nhead=args.nhead,
@@ -830,6 +898,10 @@ def run(rank, world_size, args):
             num_classes=len(phone_ids) + 1,  # +1 for the blank symbol
             subsampling_factor=4,
             num_decoder_layers=num_decoder_layers)
+    elif model_type == "contextnet":
+        model = ContextNet(
+            num_features=80,
+            num_classes=len(phone_ids) + 1) # +1 for the blank symbol
 
     model.P_scores = nn.Parameter(P.scores.clone(), requires_grad=True)
 
@@ -838,7 +910,7 @@ def run(rank, world_size, args):
     
     optimizer = Noam(model.parameters(),
                      model_size=args.attention_dim,
-                     factor=1.0,
+                     factor=args.factor,
                      warm_step=args.warm_step)
 
     best_objf = np.inf
@@ -849,11 +921,13 @@ def run(rank, world_size, args):
     global_batch_idx_train = 0  # for logging only
 
     if start_epoch > 0:
-        if finetune_checkpoint is None:
-            model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(start_epoch - 1))
-        else:
-            # finetune on other models
-            model_path = finetune_checkpoint
+        # if finetune_dir is None:
+        #     model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(start_epoch - 1))
+        # else:
+        #     # finetune on other models
+        #     model_path = os.path.join
+        model_dir = finetune_dir if finetune_dir else exp_dir
+        model_path = os.path.join(model_dir, 'epoch-{}.pt'.format(start_epoch - 1))
         ckpt = load_checkpoint(filename=model_path, model=model, optimizer=optimizer)
         best_objf = ckpt['objf']
         best_valid_objf = ckpt['valid_objf']
