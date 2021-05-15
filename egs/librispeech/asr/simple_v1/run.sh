@@ -7,7 +7,7 @@
 
 set -eou pipefail
 
-stage=0
+stage=6
 
 if [ $stage -le 1 ]; then
   local/download_lm.sh "openslr.org/resources/11" data/local/lm
@@ -58,7 +58,8 @@ if [ $stage -le 4 ]; then
 fi
 
 if [ $stage -le 5 ]; then
-  python3 ./prepare.py
+  python3 ./prepare.py \
+	  --full-libri true
 fi
 
 if [ $stage -le 6 ]; then
@@ -68,12 +69,35 @@ if [ $stage -le 6 ]; then
 
   # Single node, multi-GPU training
   # Adapting to a multi-node scenario should be straightforward.
-  ngpus=2
-  python3 -m torch.distributed.launch --nproc_per_node=$ngpus ./mmi_bigram_train.py --world_size $ngpus
-fi
+  # ngpus=2
+  # python3 -m torch.distributed.launch --nproc_per_node=$ngpus ./mmi_bigram_train.py --world_size $ngpus
+  # CUDA_VISIBLE_DEVICES=$(free-gpu) python3 ./mmi_att_transformer_train.py \
+  # 		      --full-libri true \
+  # 		      --on-the-fly-feats true \
+  # 		      --num-epochs 3 \
+  #                     --max-duration 100
+  eps=0.001
+  exp_dir=exp/adv-fgsm-$eps-ddp2
+  # CUDA_VISIBLE_DEVICES=$(free-gpu) python3 ./mmi_att_transformer_train_adv.py \
+  # 		      --full-libri true \
+  # 		      --raw true \
+  # 		      --num-epochs 3 \
+  #                     --max-duration 100 \
+  # 		      --fgsm-eps $eps \
+  # 		      --exp exp/adv-$eps
 
+  CUDA_VISIBLE_DEVICES=$(free-gpu -n2) python3 ./mmi_att_transformer_train_adv.py \
+		      --world-size 2 \
+  		      --raw true \
+  		      --num-epochs 3 \
+                      --max-duration 400 \
+		      --fgsm-eps $eps \
+		      --exp exp/adv-$eps
+fi
+exit 0
 if [ $stage -le 7 ]; then
   # python3 ./decode.py # ctc decoding
-  python3 ./mmi_bigram_decode.py --epoch 9
+  # python3 ./mmi_bigram_decode.py --epoch 9
+  CUDA_VISIBLE_DEVICES=$(free-gpu) python3 ./mmi_att_transformer_decode.py --max-duration 100
   #  python3 ./mmi_mbr_decode.py
 fi
