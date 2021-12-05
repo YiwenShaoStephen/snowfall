@@ -51,6 +51,7 @@ from snowfall.training.mmi_graph import MmiTrainingGraphCompiler
 from snowfall.training.mmi_graph import create_bigram_phone_lm
 
 from lhotse.features.kaldi.layers import Wav2LogFilterBank
+from .denoiser import DenoiserDefender
 
 def feature_extraction(
         x: torch.Tensor,
@@ -127,9 +128,12 @@ def fgsm_attack(audio,
                 scaler,
                 loss_fn,
                 feat_extractor,
+                denoiser,
                 eps=0.01):
     audio = audio.clone().to(device)
     eps = eps * audio.detach().abs().max().data
+    if denoiser is not None:
+        audio = denoiser(audio)
     feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=True)
     loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                 supervision_segments,
@@ -164,6 +168,7 @@ def pgd_attack(audio,
                scaler,
                loss_fn,
                feat_extractor,
+               denoiser,
                eps=0.01,
                iters=7,
                rand_prob=0.8):
@@ -179,6 +184,8 @@ def pgd_attack(audio,
     if torch.rand(1) < rand_prob:
         rand_pert = torch.rand_like(audio) * 2 * eps - eps
         audio = audio + rand_pert
+    if denoiser is not None:
+        audio = denoiser(audio)
     for i in range(iters):
         feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=True)
         loss, tot_frames, all_frames = forward_pass(feature, supervisions,
@@ -209,6 +216,7 @@ def get_objf(batch: Dict,
              is_training: bool,
              is_update: bool,
              feat_extractor: nn.Module,
+             denoiser: nn.Module,
              accum_grad: int = 1,
              den_scale: float = 1.0,
              att_rate: float = 0.0,
@@ -251,6 +259,7 @@ def get_objf(batch: Dict,
                                     global_batch_idx_train,
                                     scaler, loss_fn,
                                     feat_extractor,
+                                    denoiser,
                                     eps=args.fgsm_eps)
                 optimizer.zero_grad()  # clean up gradients in model that were generated from adversary
 
@@ -265,6 +274,7 @@ def get_objf(batch: Dict,
                                    global_batch_idx_train,
                                    scaler, loss_fn,
                                    feat_extractor,
+                                   denoiser,
                                    eps=args.pgd_eps,
                                    iters=args.pgd_iter,
                                    rand_prob=args.pgd_rand_prob)
@@ -281,10 +291,13 @@ def get_objf(batch: Dict,
                                        global_batch_idx_train,
                                        scaler, loss_fn,
                                        feat_extractor,
+                                       denoiser,
                                        eps=args.pgd_eps,
                                        iters=args.pgd_iter,
                                        rand_prob=args.pgd_rand_prob)
                 optimizer.zero_grad()  # clean up gradients in model that were generated from adversary
+                if denoiser is not None:
+                    audio_adv = denoiser(audio_adv)
                 feature_adv, _ = feature_extraction(audio_adv, feat_extractor)
                 loss, tot_frames, all_frames = forward_pass(feature_adv, supervisions,
                                                             supervision_segments,
@@ -299,6 +312,8 @@ def get_objf(batch: Dict,
                 scaler.scale(loss).backward()
 
     # forward and backward for paramters update
+    if denoiser is not None:
+        audio = denoiser(audio)
     feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=False)
     loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                 supervision_segments,
@@ -354,6 +369,7 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
                         graph_compiler: MmiTrainingGraphCompiler,
                         scaler: GradScaler,
                         feat_extractor: nn.Module,
+                        denoiser: nn.Module,
                         den_scale: float = 1,
                         args=None,
                         ):
@@ -375,6 +391,7 @@ def get_validation_objf(dataloader: torch.utils.data.DataLoader,
             is_training=False,
             is_update=False,
             feat_extractor=feat_extractor,
+            denoiser=denoiser,
             den_scale=den_scale,
             scaler=scaler,
             args=args
@@ -436,6 +453,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
     prev_timestamp = datetime.now()
     
     fbank = Wav2LogFilterBank().to(device)
+    denoiser = DenoiserDefender(denoiser_model_dir, denoiser_model_ckpt, device)
 
     model.train()
     for batch_idx, batch in enumerate(dataloader):
@@ -464,6 +482,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
             is_training=True,
             is_update=is_update,
             feat_extractor=fbank,
+            denoiser=denoiser,
             accum_grad=accum_grad,
             den_scale=den_scale,
             att_rate=att_rate,
@@ -513,6 +532,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                 graph_compiler=graph_compiler,
                 scaler=scaler,
                 feat_extractor=fbank,
+                denoiser=denoiser,
                 args=args,
                 )
             if world_size > 1:
