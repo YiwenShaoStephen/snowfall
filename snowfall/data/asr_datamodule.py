@@ -6,7 +6,7 @@ from typing import List, Union
 from torch.utils.data import DataLoader
 
 from lhotse import Fbank, FbankConfig, load_manifest
-from lhotse import LibrosaFbank, LibrosaFbankConfig
+from lhotse.features.librosa_fbank import LibrosaFbank, LibrosaFbankConfig
 from lhotse.dataset import AudioSamples, BucketingSampler, CutConcatenate, CutMix, K2SpeechRecognitionDataset, \
     RandomizedSmoothing, SingleCutSampler, \
     SpecAugment
@@ -111,26 +111,27 @@ class AsrDataModule(DataModule):
         logging.info("About to get train cuts")
         cuts_train = self.train_cuts()
 
-        logging.info("About to get Musan cuts")
-        cuts_musan = load_manifest(self.args.feature_dir / 'cuts_musan.json.gz')
+        # logging.info("About to get Musan cuts")
+        # cuts_musan = load_manifest(self.args.feature_dir / 'cuts_musan.json.gz')
         if self.args.librosa:
             cuts_train = cuts_train.filter(lambda c: '_sp' not in c.id)
             cuts_train = cuts_train.resample(22050)
             cuts_musan = cuts_musan.resample(22050)
 
         logging.info("About to create train dataset")
-        transforms = [CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20))]
-        if self.args.concatenate_cuts:
-            logging.info(f'Using cut concatenation with duration factor '
-                         f'{self.args.duration_factor} and gap {self.args.gap}.')
-            # Cut concatenation should be the first transform in the list,
-            # so that if we e.g. mix noise in, it will fill the gaps between different utterances.
-            transforms = [
-                             CutConcatenate(
-                                 duration_factor=self.args.duration_factor,
-                                 gap=self.args.gap
-                             )
-                         ] + transforms
+        # transforms = [CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20))]
+        # if self.args.concatenate_cuts:
+        #     logging.info(f'Using cut concatenation with duration factor '
+        #                  f'{self.args.duration_factor} and gap {self.args.gap}.')
+        #     # Cut concatenation should be the first transform in the list,
+        #     # so that if we e.g. mix noise in, it will fill the gaps between different utterances.
+        #     transforms = [
+        #                      CutConcatenate(
+        #                          duration_factor=self.args.duration_factor,
+        #                          gap=self.args.gap
+        #                      )
+        #                  ] #+ transforms
+        transforms = None
 
         smoothing = RandomizedSmoothing(
             sigma=[
@@ -212,7 +213,7 @@ class AsrDataModule(DataModule):
             train,
             sampler=train_sampler,
             batch_size=None,
-            num_workers=4,
+            num_workers=1,
             persistent_workers=True,
         )
         return train_dl

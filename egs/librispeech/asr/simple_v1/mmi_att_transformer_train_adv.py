@@ -51,7 +51,7 @@ from snowfall.training.mmi_graph import MmiTrainingGraphCompiler
 from snowfall.training.mmi_graph import create_bigram_phone_lm
 
 from lhotse.features.kaldi.layers import Wav2LogFilterBank
-from .denoiser import DenoiserDefender
+from denoiser.denoiser import DenoiserDefender
 
 def feature_extraction(
         x: torch.Tensor,
@@ -63,8 +63,8 @@ def feature_extraction(
     Do feature extraction and return feature, supervisions
     """
 
-    if compute_gradient:
-        x.requires_grad = True
+    # if compute_gradient:
+    #     x.requires_grad = True
 
     feature = extractor(x)
 
@@ -184,10 +184,15 @@ def pgd_attack(audio,
     if torch.rand(1) < rand_prob:
         rand_pert = torch.rand_like(audio) * 2 * eps - eps
         audio = audio + rand_pert
-    if denoiser is not None:
-        audio = denoiser(audio)
+    audio = audio.detach()
+    # print(audio.shape)
     for i in range(iters):
-        feature, _ = feature_extraction(audio, feat_extractor, compute_gradient=True)
+        audio.requires_grad = True
+        if denoiser is not None:
+            audio_denoised = denoiser(audio)
+        else:
+            audio_denoised = audio
+        feature, _ = feature_extraction(audio_denoised, feat_extractor, compute_gradient=True)
         loss, tot_frames, all_frames = forward_pass(feature, supervisions,
                                                     supervision_segments,
                                                     texts, P, model,
@@ -407,6 +412,7 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
                     valid_dataloader: torch.utils.data.DataLoader,
                     model: AcousticModel,
                     ali_model: Optional[AcousticModel],
+                    denoiser: Optional[nn.Module],
                     P: k2.Fsa,
                     device: torch.device,
                     graph_compiler: MmiTrainingGraphCompiler,
@@ -453,9 +459,10 @@ def train_one_epoch(dataloader: torch.utils.data.DataLoader,
     prev_timestamp = datetime.now()
     
     fbank = Wav2LogFilterBank().to(device)
-    denoiser = DenoiserDefender(denoiser_model_dir, denoiser_model_ckpt, device)
 
     model.train()
+    if denoiser is not None:
+        denoiser.model.train()
     for batch_idx, batch in enumerate(dataloader):
         forward_count += 1
         if forward_count == accum_grad:
@@ -647,7 +654,7 @@ def get_parser():
     parser.add_argument(
         '--use-ali-model',
         type=str2bool,
-        default=True,
+        default=False,
         help='If true, we assume that you have run ./ctc_train.py '
              'and you have some checkpoints inside the directory '
              'exp-lstm-adam-ctc-musan/ .'
@@ -706,6 +713,22 @@ def get_parser():
         help='Discards optimier, LR scheduler, grad scaler states '
              'if they are present in the checkpoint.'
     )
+    parser.add_argument(
+        '--denoiser-model-dir',
+        type=str,
+        default=None,
+        help='denoiser model checkpoint dir')
+    parser.add_argument(
+        '--denoiser-model-ckpt',
+        type=str,
+        default=None,
+        help='denoiser model checkpoint')
+    parser.add_argument(
+        '--exp',
+        type=str,
+        required=True,
+        help="exp dir"
+    )
     return parser
 
 
@@ -731,7 +754,8 @@ def run(rank, world_size, args):
     fix_random_seed(42)
     setup_dist(rank, world_size, args.master_port)
 
-    exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv) + '-4')
+    # exp_dir = Path('exp-' + model_type + '-noam-mmi-att-musan-sa-vgg-adv-' + str(args.adv) + '-4')
+    exp_dir = Path(args.exp)
     setup_logger(f'{exp_dir}/log/log-train-{rank}')
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f'{exp_dir}/tensorboard')
@@ -821,7 +845,12 @@ def run(rank, world_size, args):
     else:
         ali_model = None
         logging.info('No ali_model')
+        
+    if args.denoiser_model_ckpt:
+        denoiser = DenoiserDefender(args.denoiser_model_dir, args.denoiser_model_ckpt, device)
+    # denoiser = None
 
+        
     optimizer = Noam(model.parameters(),
                      model_size=args.attention_dim,
                      factor=args.lr_factor,
@@ -866,6 +895,7 @@ def run(rank, world_size, args):
             valid_dataloader=valid_dl,
             model=model,
             ali_model=ali_model,
+            denoiser=denoiser,
             P=P,
             device=device,
             graph_compiler=graph_compiler,

@@ -64,17 +64,18 @@ class DenoiserDefender(nn.Module):
     def __init__(self, denoiser_model_dir: Path, denoiser_model_ckpt: Path,  device: str):
         super().__init__()
         self.device = device
-        with open(denoiser_model_dir / 'config.yml') as f:
-            self.config = yaml.load(f, Loader=yaml.Loader)
+        # with open(denoiser_model_dir / 'config.yml') as f:
+        #     self.config = yaml.load(f, Loader=yaml.Loader)
 
-        #self.model =  TasNet(num_spk=1, layer=8, enc_dim=128, stack=1, kernel=3, win=1, TCN_dilationFactor=2)
-        self.model = TasNet(num_spk=self.config['num_spk'], layer=self.config['layer'], enc_dim=self.config['enc_dim'], stack=self.config['stack'], kernel=self.config['kernel'], win=self.config['win'], TCN_dilationFactor=self.config['TCN_dilationFactor'])
+        self.model = TasNet(num_spk=1, layer=8, enc_dim=128, stack=1, kernel=3, win=1, TCN_dilationFactor=2)
+        # self.model = TasNet(num_spk=self.config['num_spk'], layer=self.config['layer'], enc_dim=self.config['enc_dim'], stack=self.config['stack'], kernel=self.config['kernel'], win=self.config['win'], TCN_dilationFactor=self.config['TCN_dilationFactor'])
 
-        model_path = denoiser_model_dir / denoiser_model_ckpt
+        # model_path = denoiser_model_dir / denoiser_model_ckpt
+        model_path = denoiser_model_ckpt
 
-        #self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))['model_state_dict'])
-        load_string = self.config["load_model_string"]
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device)[load_string])
+        self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))['model_state_dict'])
+        # load_string = self.config["load_model_string"]
+        # self.model.load_state_dict(torch.load(model_path, map_location=self.device)[load_string])
         self.model.to(self.device)
 
         self.reconstructor = DenoiserReconstruction(self.model, self.device)
