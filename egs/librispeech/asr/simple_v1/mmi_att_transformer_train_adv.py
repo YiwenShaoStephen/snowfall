@@ -862,7 +862,9 @@ def run(rank, world_size, args):
     best_objf = np.inf
     best_valid_objf = np.inf
     best_epoch = start_epoch
-    best_model_path = os.path.join(exp_dir, 'best_model.pt')
+    best_model_path = os.path.join(exp_dir, 'best_asr_model.pt')
+    if denoiser is not None:
+        best_denoiser_path = os.path.join(exp_dir, 'best_denoiser_model.pt')
     best_epoch_info_filename = os.path.join(exp_dir, 'best-epoch-info')
     global_batch_idx_train = 0  # for logging only
 
@@ -927,6 +929,8 @@ def run(rank, world_size, args):
                             valid_objf=valid_objf,
                             global_batch_idx_train=global_batch_idx_train,
                             local_rank=rank)
+            if denoiser is not None:
+                torch.save(denoiser.model.state_dict(), best_denoiser_path)
             save_training_info(filename=best_epoch_info_filename,
                                model_path=best_model_path,
                                current_epoch=epoch,
@@ -940,6 +944,8 @@ def run(rank, world_size, args):
 
         # we always save the model for every epoch
         model_path = os.path.join(exp_dir, 'epoch-{}.pt'.format(epoch))
+        if denoiser is not None:
+            denoiser_path = os.path.join(exp_dir, 'epoch-{}-denoiser.pt'.format(epoch))
         save_checkpoint(filename=model_path,
                         optimizer=optimizer,
                         scheduler=None,
@@ -951,6 +957,8 @@ def run(rank, world_size, args):
                         valid_objf=valid_objf,
                         global_batch_idx_train=global_batch_idx_train,
                         local_rank=rank)
+        if denoiser is not None:
+            torch.save(denoiser.model.state_dict(), denoiser_path)
         epoch_info_filename = os.path.join(exp_dir, 'epoch-{}-info'.format(epoch))
         save_training_info(filename=epoch_info_filename,
                            model_path=model_path,
